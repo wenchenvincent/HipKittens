@@ -92,14 +92,44 @@ balances. Latency sources: MFMA throughput per shape is in CDNA3/4 ISA matrix-in
 (deterministic); LDS/global latency under load (bank conflicts, queue depth, cache) is not fixed —
 measure via PMC counters. Balance = the interaction; always profiled per kernel, not predicted.
 
-### waitcnt placement (tuning idea, untested)
-c2's `__builtin_amdgcn_s_waitcnt(0)` is a full drain, but its `lgkmcnt` part is redundant with c3's
-`lgkmcnt(0)` — so c2's drain effectively just waits `vmcnt` for the As[toc]/Bs[toc] prefetch issued
-in c0. By c2 that prefetch has only 2 phases of flight, so it may stall. Idea: move the `vmcnt`
-drain to c3 *after* the MMA (+ a `sched_barrier` so it doesn't float up) → ~3 phases of flight,
-likelier already landed, no stall; correctness holds (still before next-iter c0 ds_read, buffers
-independent). Only helps if global is latency-bound past ~2 phases; if it lands within 2, c2's drain
-is already a near-no-op. One-line experiment — try both, time on rocprof.
+### why c2's s_waitcnt(0) must stay in c2 (tested)
+Tempting idea: c2's `__builtin_amdgcn_s_waitcnt(0)` is a full drain whose `lgkmcnt` part looks
+redundant with c3's `lgkmcnt(0)`, so move the `vmcnt`/prefetch drain to c3 to give the As[toc]/Bs[toc]
+prefetch more flight time. **Tested at 8192³ on MI355X — it breaks correctness (err ~200 vs bf16
+noise 4), with zero perf change (1097–1101 TFLOPS, noise).** Matrix: drain in c2 = PASS; drain in c3
+(before OR after the mma) = FAIL; drain in both = PASS. So the c2 drain is load-bearing, not
+conservative.
+
+Mechanism (ISA-confirmed: only diff is `s_waitcnt(0)`↔`s_barrier` order; no instruction hoist).
+
+Two facts that combine:
+- `G::load` is a **group** load — As[toc] is written by all 512 threads (laneid/warpid partition),
+  but the c0 `ds_read` consumes it in a different (warp_row/warp_col) partition ⇒ a wave reads bytes
+  *another wave* prefetched.
+- `s_waitcnt` is **per-wave**; `s_barrier` syncs execution but does NOT drain memory. So only row1's
+  own drain retires row1's prefetch DMA.
+
+row0 leads by one cluster, so the wall-clock alignment is:
+```
+row0 c1        ‖ row1 c0
+row0 c2        ‖ row1 c1
+row0 c3        ‖ row1 c2
+row0 c0(N+1)   ‖ row1 c3(N)   ← leading half's next-iter read aligns with lagging half's c3
+```
+
+Trace with drain in c3:
+- row1's prefetch (issued c0 of iter N) is drained in row1 c3(N).
+- row1 c3(N) is the same phase as row0 c0(N+1).
+- row0's c0(N+1) `ds_read` executes *before* that phase-ending barrier — i.e. before row1's c3 drain
+  is synchronized to row0.
+- ⇒ row0 reads row1's still-in-flight prefetch slice → garbage. Corruption.
+
+Trace with drain in c2 (baseline):
+- row1's prefetch drains in row1 c2(N), which aligns with row0 c1(N) — a full cluster before row0's
+  c0(N+1) read, with a barrier in between. Safe.
+
+Takeaway: under ping-pong, the group-prefetch must be drained one cluster ahead of the leading half's
+consuming read. Without the stagger, c3 would be fine. (Repro harness `_exp_*` was scratch, removed.)
 
 ## WGID swizzle (2 stacked remaps)
 HW dispatches workgroups round-robin across 8 XCDs, so consecutive tiles scatter chiplets, killing
