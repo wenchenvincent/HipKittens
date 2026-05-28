@@ -57,15 +57,17 @@ Cluster contents (32x16 loop): c0 = ds_read slice0 + `G::load` global prefetch�
 c2 = ds_read slice1 + `s_waitcnt(0)` drain; c3 = mma×8. Each `|` is an `s_barrier` (all 8 waves
 meet); halves offset 1 phase via the B1 stagger:
 ```
-phase:    p0     p1     p2     p3     p4
-row0:   c0 LD | c1 MMA| c2 LD | c3 MMA|  ...
-row1:   ----- | c0 LD | c1 MMA| c2 LD | c3 MMA   (1 phase behind, via warp_row==1 barrier B1)
-              └─ MMA(0) overlaps LD(1) ┘
+phase:    p0     p1     p2     p3     p4     p5
+row0:   c0 LD | c1 MMA| c2 LD | c3 MMA| c0 LD| c1 MMA  ...
+row1:   ----- | c0 LD | c1 MMA| c2 LD | c3 MMA| c0 LD  (1 phase behind, via warp_row==1 barrier B1)
+XDL:    idle  | row0  | row1  | row0  | row1  | row0   (matrix unit fed by alternating halves)
+mem:    row0  | row1  | row0  | row1  | row0  | row1   (LDS/global pipes used by the OTHER half)
 ```
-Vertical = same wall-clock; `|` = barrier. Whichever half is in MMA is paired with the other in LD,
-so the matrix unit is fed every phase. Per MMA cell: `setprio(1)` wraps it, `lgkmcnt(0)` before it
-(LDS landed; vmcnt prefetch stays in flight). Buffers: compute reads tic ‖ prefetch fills toc → swap
-at K-step end.
+Vertical = same wall-clock; `|` = barrier. **The XDL (SIMD matrix unit) is the binding resource;
+both halves alternate feeding it so it stays ~100% busy.** Each half spends half its phases issuing
+mfmas (to the XDL) and half doing loads (on the LDS/mem pipes); the two halves are 180° out of phase
+on each resource. Per MMA cell: `setprio(1)` wraps it, `lgkmcnt(0)` before it (LDS landed; vmcnt
+prefetch stays in flight). Buffers: compute reads tic ‖ prefetch fills toc → swap at K-step end.
 
 ### s_setprio
 Wraps every mma: `setprio(1); mma; setprio(0)`. Both warp-row halves share a SIMD; issue funnels
@@ -91,6 +93,96 @@ K_STEP/DOT_SLICE + MFMA shape are sized for this — fp8/mxfp8/16x32 variants ex
 balances. Latency sources: MFMA throughput per shape is in CDNA3/4 ISA matrix-instruction tables
 (deterministic); LDS/global latency under load (bank conflicts, queue depth, cache) is not fixed —
 measure via PMC counters. Balance = the interaction; always profiled per kernel, not predicted.
+
+### ATT field definitions (per rocprof-trace-decoder header)
+From `include/trace_decoder_types.h` (ROCm/rocprof-trace-decoder, amd-mainline):
+- `duration` = `stall + issue_time` (gfx9 — gfx950 is gfx9 family) = total wave-time at the instruction PC.
+- `stall` = time *before issue begins* (not "wait for results").
+- rocprofv3's CSV column **"Latency" corresponds to accumulated `duration` across hits**, verified
+  empirically: `sum(CSV.Latency) / sum(wave.duration)` ≈ 0.94, ~6% unattributed (likely
+  wave-launch/cleanup cycles not pinned to instruction PCs).
+- "stall %" (= `Stall / Latency`) is therefore the fraction of wave-time spent *waiting to issue*.
+- `Hitcount` and `Idle` are CSV-aggregator additions, not in the header; `Idle` semantics
+  unconfirmed.
+
+### XDL is single-occupancy for 32x32x16 BF16 (measured + spec-confirmed)
+Per-instruction ATT (one CU, MI355X, baseline) on the 16 mfmas in c1: mfma #1 stalls 29% (unit
+idle, fresh start), but **#2–8 all stall ~86%** despite targeting *different* accumulators from #1
+(no RAW); #9–16 (which DO reuse accumulators) sit at the same ~86%. Per the decoder header `stall`
+is wait-*before*-issue — so RAW (wait-for-result) is ruled out, and the gate is the XDL
+itself.
+
+Numbers: CDNA4 ISA gives `v_mfma_f32_32x32x16_bf16` = **32 cyc** (same as CDNA3; LLVM's
+`Write8PassMAI` = 8 passes × 4 cyc/pass). ATT chained-mfma stall ≈ **30 cyc** ≈ the full 32 cyc.
+That equality means the next mfma waits essentially the *entire* execution time of the previous one,
+not some shorter issue interval — i.e. **the XDL pipeline is single-occupancy for this shape: one
+mfma in flight, 32 cyc to retire, next issue waits for retire**. No pipelining of in-flight
+32x32x16 BF16 mfmas. 16 mfmas × 32 cyc = **512 cyc/cluster floor**; ATT measured 487–489, **95% of
+floor**, the gap being mfma #1's free issue.
+
+Caveat: this is the structural read for *this* shape on *this* config. Other MFMA shapes
+(e.g. 16x16x32) may pipeline differently on the same XDL.
+
+Reframes the ping-pong intent: ping-pong is **not** hiding MFMA latency — there's no in-flight
+overlap to hide for this shape. It's about **keeping the single-occupancy XDL fed** by alternating
+which half issues. Per K-step the XDL serves 64 mfmas (32 from each half) × 32 cyc = 2048 cyc, and
+the wall-clock per K-step is also ~2048 cyc ⇒ XDL utilization ≈ 100%. Each half's loads run on the
+memory pipes in parallel with the other half's mfmas. Implication for tuning: more accumulators
+won't speed c1/c3 (no RAW to hide); only a different MFMA shape (faster XDL throughput) or pipelined
+XDL behavior on this shape would.
+
+### Per-cluster cycles and barrier waits (ATT, normalized to cyc/wave/iter)
+
+| Cluster | role                                  | total | dominant cost              | barrier wait |
+|---------|---------------------------------------|------:|----------------------------|-------------:|
+| c0      | ds_read slice0 + global prefetch      | ~501  | gload 169, ds_read 101     | 41           |
+| c1      | MMA ×16                               | ~630  | mfma 489                   | 125          |
+| c2      | ds_read slice1 + `s_waitcnt(0)` drain | ~543  | drain wait 196, ds_read 110| **209**      |
+| c3      | MMA ×16                               | ~579  | mfma 487                   | 60           |
+
+Two signatures stand out:
+
+1. **Global-load stall is real and large.** The `s_waitcnt(0)` drain in c2 = 196 cyc/wave/iter of
+   pure wait-for-vmcnt — the prefetch is genuinely *not* landing within the prior 2 phases, it's
+   latency-bound. But ~196 ≪ partner half's c1 mma (~512), so under ping-pong it's hidden inside
+   the partner's MMA wall-clock and never extends the critical path.
+2. **The biggest barrier wait sits at c2-end (209 cyc/wave/iter), and it's the load-half waiting
+   for the compute-half's MFMA to retire.** At c2-end the pairing is row0 c2 (load+drain, ~334 cyc
+   of work) ‖ row1 c1 (mma, ~505 cyc). row0 reaches the barrier ~171 cyc early and parks until
+   row1's c1 mma finishes. Predicted ~171, measured 209 — same direction and magnitude, small gap is
+   un-attributed cluster overhead. That stall *is* the XDL-bound signature.
+
+Asymmetry caveat: by the same arithmetic, c3-end should wait ~185 cyc (row0 c3 mma 519 ‖ row1 c2
+load+drain 334), but ATT shows only **60 cyc**. The qualitative picture (load-half waits for
+mma-half) is right, but the exact per-barrier numbers don't all fall out of this simple model.
+Likely contributors: second-workgroup interactions on the CU at occupancy 2, per-half drift in
+global-drain time depending on memory-bus phase, and aggregate-across-32-waves averaging masking
+per-wave detail. Pinning it would need per-wave traces, not the aggregate CSV.
+
+### MFMA efficiency (steady-state XDL utilization)
+
+**Headline: steady-state XDL utilization ≈ 91%** during the loop body.
+
+Per K-step on one SIMD (compile output: occupancy 2 waves/SIMD = 1 workgroup/CU, so no
+cross-workgroup contention):
+- XDL must serve 4 cluster-phases × 16 mfmas × 32 cyc = **2048 cyc of mfma work** (row0 c1, row1 c1,
+  row0 c3, row1 c3 — single-occupancy means these are 4 sequential 512-cyc windows).
+- K-step wall-clock per wave (barrier-synced across all 8 waves) ≈ **2253 cyc**.
+- ⇒ XDL busy / wall-clock = **2048 / 2253 ≈ 91%**.
+
+The remaining ~9% (~205 cyc/K-step, ~51 cyc × 4 phase boundaries) is XDL-idle at the **phase
+handoffs** — brief windows after one half's cluster ends and before the other half's first mfma
+issues, eaten by `s_barrier` release + `setprio` + `lgkmcnt(0)` overhead. The schedule's only
+remaining slack lives there.
+
+For comparison, **whole-kernel FLOPS efficiency ≈ 80%** vs theoretical peak at the operating clock
+(1097 TFLOPS achieved / 1365 TFLOPS peak at the measured ~1.3 GHz, power-capped). The ~11% gap from
+the 91% in-loop number is non-loop overhead: kernel launch, prologue/epilogue, grid tails
+(1024 workgroups over 256 CUs at occupancy 1 ⇒ 4 sequential waves of workgroups per CU). Whole-
+kernel is the right number for "how fast does this run end-to-end"; steady-state XDL utilization is
+the right number for "how tightly is the loop body packed." For tuning the schedule, the 91% is
+what matters — and shaving the 9% means attacking phase-boundary overhead, which is harder than
+anything we explored above.
 
 ### why c2's s_waitcnt(0) must stay in c2 (tested)
 Tempting idea: c2's `__builtin_amdgcn_s_waitcnt(0)` is a full drain whose `lgkmcnt` part looks
