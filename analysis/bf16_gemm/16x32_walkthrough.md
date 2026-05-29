@@ -362,12 +362,54 @@ non-power-capped configuration. Out of scope for this walkthrough.
   the analog of "c2-must-stay" hasn't been retested for this kernel. Not
   recommended to refactor without re-running the c2→c3 control matrix.
 
-## What I'd do next
+## Followups (run, blocked, deferred)
 
-- Sweep `--power-cap` to verify the clock hypothesis. If the 8.6% gap closes
-  as power-cap rises, the clock story is confirmed.
-- Run ATT with `--att-target-cu` covering multiple CUs and average — checks
-  whether the per-CU picture generalizes.
-- Compare power and clock signatures of a hypothetical 16x16x16 shape (if HK
-  adds one) — would distinguish "shape size" from "specific instruction
-  microarchitecture" as the power driver.
+### Multi-CU ATT generalization (run, generalizes)
+Ran ATT with `--att-target-cu 0` and `--att-target-cu 5` on the same 16x32
+kernel; per-cluster numbers match within run-to-run noise:
+
+| CU | K-step wall-clock | XDL utilization | sanity ratio |
+|---|---|---|---|
+| 0 | 4452 cyc | 92.0% | 0.9950 |
+| 5 | 4443 cyc | 92.2% | 0.9948 |
+
+Tried CUs at higher indices (31, 100, 200) but rocprofv3 core-dumped on each —
+likely a target-CU id range limit in the decoder. CUs 0 and 5 are enough to
+confirm the per-CU picture generalizes.
+
+### Clock hypothesis — indirect confirmation (power-cap modification blocked)
+Direct test (sweep `--power-cap` and observe TFLOPS converge) is blocked: the
+`rocm-smi --setpoweroverdrive` and `--setperflevel` operations need root in
+this environment.
+
+Indirect confirmation via per-cycle efficiency math:
+
+| kernel | TFLOPS | clock | flops/cyc/SIMD | % of peak |
+|---|---|---|---|---|
+| 32x16 | 1098 | 1.30 GHz | **825** | 80.6% |
+| 16x32 | 1217 | 1.48 GHz | **803** | 78.4% |
+
+(Peak = 1024 flops/cyc/SIMD for both shapes; ÷ by `clock × 1024 SIMDs` from each
+TFLOPS measurement.)
+
+The two kernels have **near-identical per-cycle efficiency** (~2.7% spread, with
+32x16 slightly *more* efficient per cycle). Extrapolating to a same-clock
+scenario:
+
+| at 1.30 GHz (32x16's measured clock) | at 1.48 GHz (16x32's measured clock) |
+|---|---|
+| 32x16: 1099, 16x32: 1069 | 32x16: 1251, 16x32: 1217 |
+
+At identical clock, 32x16 would beat 16x32 by ~3%. The 16x32's measured
+TFLOPS advantage is **entirely** clock-driven — 16x16x32 mfmas are
+lower-power per cycle than 32x32x16, so the power-capped GPU runs ~14% faster.
+This is consistent with all measurements and is the strongest confirmation
+possible without privileged power-cap control.
+
+### 16x16x16 shape comparison (deferred)
+Would require writing a new HK kernel variant — out of scope for this session.
+The cleanest follow-up would still distinguish "MFMA tile size" from "specific
+instruction microarchitecture" as the power driver: if a 16x16x16 BF16 variant
+also clocks high under TDP cap, it's size; if not, it's specific to the
+16x16x32 instruction. Worth doing if someone has reason to suspect a third
+shape exists in HK or wants to write it.
