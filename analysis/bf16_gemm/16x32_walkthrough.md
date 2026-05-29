@@ -176,6 +176,12 @@ accumulator grid, with prefetches into `tic`-toc-swapped buffers interleaved.
 
 ### Pipeline diagram (per K-step)
 
+**Counting units to avoid confusion:** the source loop is unrolled by 2 (`tile += 2`), so each
+source iteration covers **2 K-steps** and contains **16 `s_barrier`s and 8 `mma_ABt`s**. The diagram
+below shows **one K-step** (half a source iteration) — so 8 phases here, 16 per source iter, 4
+mma_ABts per K-step, 8 per source iter. ATT reports per-source-iter numbers; this doc uses
+per-K-step throughout for parity with the 32x16 walkthrough.
+
 8 alternating LD/MMA phases per K-step (vs 32x16's 4), each ~half as long.
 - `LD_k`: one `ds_read` of A or B half-tile + one `G::load` prefetch into the next toc.
 - `MMA_k`: one `mma_ABt` over a `C_accum[i][j]` = 16 mfmas of 16x16x32 ≈ 256 cyc.
