@@ -8,6 +8,11 @@ first — most low-level concepts (MFMA layout, single-occupancy XDL, group-load
 semantics, ATT terminology) carry over; this doc covers what's structurally
 different.
 
+**Canonical AMD reference for this exact kernel:** the ROCm Blogs post
+[Deep Dive Into 4-Wave Interleave FP8 GEMM](https://rocm.blogs.amd.com/software-tools-optimization/4wave-fp8gemm/README.html)
+covers the same pattern from AMD's perspective; recommended reading
+alongside this walkthrough.
+
 > Built and measured on MI355X (CDNA4, gfx950) at 8192³, ROCm 7.2. Source
 > line numbers and shapes verified from the file; MFMA cycle count from LLVM
 > `SISchedule.td`; achieved TFLOPS, clock, and power from running the kernel
@@ -97,16 +102,29 @@ Per `include/ops/warp/register/tile/mma.cuh:119`, HK's fp8 MFMA path emits
 `__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4` — a single instruction
 that consumes K=128 of fp8 input and produces a 16×16 fp32 output.
 
-**Cycle count: 32 cyc per issue** on gfx950, verified from LLVM
-`SISchedule.td`:
-```
-def : InstRW<[WriteMFMAScale_16X16X128_F8F6F4, MIMFMARead],
-       (instregex "^V_MFMA(_SCALE)?_.32_16X16X128_F8F6F4")>;
+**Cycle count: 32 cyc per issue** on gfx950 (with FP8 inputs), confirmed from
+two sources:
 
-def WriteMFMAScale_16X16X128_F8F6F4 : SchedWriteVariant<[
-    SchedVar<PredIsF8_MFMA_SCALE, [Write8PassMAI]>,    // FP8 path: 8 passes × 4 cyc = 32
-    SchedVar<NoSchedPred, [Write4PassMAI]>]>;          // non-FP8: 16 cyc
-```
+- AMD's CDNA4 ISA reference ([PDF](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna4-instruction-set-architecture.pdf)),
+  MFMA instruction table: this shape is listed as "16 or 32" cycles with the
+  note that **the FP8 input case takes the larger count** (32 cyc), and
+  FP6/FP4 inputs take 16 cyc. Community summary in
+  [salykova.github.io/matrix-cores-cdna](https://salykova.github.io/matrix-cores-cdna)
+  consolidates the same table.
+- LLVM `SISchedule.td` (cross-check):
+  ```
+  def : InstRW<[WriteMFMAScale_16X16X128_F8F6F4, MIMFMARead],
+         (instregex "^V_MFMA(_SCALE)?_.32_16X16X128_F8F6F4")>;
+  def WriteMFMAScale_16X16X128_F8F6F4 : SchedWriteVariant<[
+      SchedVar<PredIsF8_MFMA_SCALE, [Write8PassMAI]>,    // FP8: 8 passes × 4 cyc = 32
+      SchedVar<NoSchedPred, [Write4PassMAI]>]>;          // FP6/FP4: 4 × 4 = 16
+  ```
+  matches the ISA table's precision-dependent behavior.
+
+(Useful corollary: if a future HK kernel uses FP4 / FP6 with this same
+`16x16x128` shape, it would get 16 cyc per issue → 4096 flops/cyc/SIMD peak,
+2× the FP8 case. A reason to want narrower-precision variants if accumulator
+precision allows.)
 
 Flops per instruction (small but important):
 - BF16 32x32x16: 32·32·16·2 = 32,768 flops in 32 cyc ⇒ 1024 flops/cyc/SIMD.
