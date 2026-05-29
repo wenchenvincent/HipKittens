@@ -18,22 +18,31 @@ different.
 | metric | FP8 4-wave (this kernel) | BF16 16x32 8-wave (for context) |
 |---|---|---|
 | Achieved TFLOPS @ 8192³ | **2553** (avg) / 2594 (best) | 1217 |
-| Sustained GFX clock | **~2.4 GHz** (spec max) | ~1.48 GHz |
-| Socket power under load | **~296 W** (NOT power-limited) | ~1390 W (TDP-capped) |
+| Achieved GFX clock | **~1.5 GHz** (derived from wave durations) | ~1.48 GHz |
+| Socket power under load | ~297 W | ~1390 W (TDP-capped) |
 | MFMA shape | `mfma_scale_f32_16x16x128_f8f6f4` | `mfma_f32_16x16x32_bf16` |
 | MFMA cycles per issue | **32** (Write8PassMAI, gfx950) | 16 |
 | Flops per MFMA instruction | 65,536 (16·16·128·2) | 8,192 |
 | Per-SIMD peak flops/cyc | **2048** (2× BF16) | 1024 |
-| Per-cycle efficiency vs peak | **50.7%** | 78.4% |
+| Per-cycle efficiency vs peak | **~81%** | ~78% |
 | Waves per workgroup | 4 (2×2 grid) | 8 (2×4 grid) |
 | Occupancy (waves/SIMD) | 1 | 2 |
 | VGPRs (compile remark) | 256 | 210 |
 
-**Most surprising finding:** the FP8 kernel is **not power-limited at all** —
-draws ~296 W on a card with a ~1390 W TDP cap, and the clock hits the spec
-max of 2.4 GHz unrestricted. The 2× TFLOPS over BF16 is split between the
-higher clock (~62% more) and the doubled per-cycle peak; the per-cycle
-*efficiency* is actually *lower* than BF16. So there's headroom on both axes.
+**Net story:** the FP8 kernel runs at ~1.5 GHz — essentially the same clock as
+BF16 — and achieves ~81% of per-cycle peak — essentially the same scheduling
+quality as BF16. The **2× TFLOPS advantage** over BF16 comes entirely from the
+**2× per-cycle peak** of the FP8 MFMA (`16x16x128` packs 2× the flops of
+`16x16x32` in the same 32 cycles), not from clock or power differences.
+
+**A measurement caveat worth flagging up front** (and the methodology section
+below explains in detail): the `amd-smi` `CLK` and `GFX_ACTIVITY` readings
+were both *misleading* for this kernel's burst-launch pattern — `CLK` reports
+the between-launch boost clock (2.4 GHz) rather than the achieved compute
+clock; `GFX_ACTIVITY` underreports the active phases. The achieved clock
+quoted above (~1.5 GHz) is derived from per-wave cycle counts in the ATT
+trace divided by kernel wall-time, which is independent of `amd-smi` and
+gives the right answer.
 
 ## Structure: three kernels in one file, size-dispatched
 
@@ -236,38 +245,50 @@ Bench (best of 100 timing iters after 500 warmup, with rotating buffers):
 - **Avg: 0.431 ms / 2553.34 TFLOPS**
 - Correctness: PASSED (CPU reference comparison, rtol implicit ~0.01)
 
-Power/clock measurement under sustained load — cross-checked with two tools
-(documented carefully because `amd-smi`'s `GFX_ACTIVITY` metric proved
-misleading for this burst-launch pattern):
+Achieved clock measurement — the right way (cycle counts) and the wrong way
+(amd-smi clock readings):
 
-- **`amd-smi metric -g 3`** across all 7 XCDs during the warmup phase
-  (500 back-to-back kernel launches ≈ 215 ms of continuous GPU work):
-  every XCD reads **2398–2407 MHz** with `SOCKET_POWER` consistently at
-  **296–297 W**. The clock readings are stable across 10+ samples spanning
-  ~1.8 s of work.
-- **`rocm-smi -d 3 --showclocks`** independent cross-check during the same
-  window: `sclk clock level: 1: (2400Mhz)` — confirms current sclk = 2400 MHz.
-- **Idle reference**: between kernel bursts the same tools read 95–160 MHz
-  at 230–245 W. So the active phase is distinguishable from idle by a clear
-  +50 W power jump and a ~15× clock jump.
+**The wrong way (amd-smi CLK, what I cited first):** `amd-smi metric -g 3`
+under load reports `CLK: 2398–2407 MHz` across all XCDs, `SOCKET_POWER: 297 W`,
+and `rocm-smi -d 3 --showclocks` cross-checks to `sclk clock level: 1: (2400Mhz)`.
+This *looks* like a sustained 2.4 GHz reading. **But that's the SCLK setpoint
+DPM transitions to between launches** — not the achieved clock during the
+0.43 ms of active MFMA work in each launch. With 0.43 ms compute / ~1 ms
+host overhead per launch, amd-smi mostly samples the inter-launch boost
+state, and the SCLK setpoint stays elevated through these gaps so even a
+"during-launch" sample reports 2.4 GHz.
 
-Methodology caveat: `amd-smi`'s `GFX_ACTIVITY` metric reads `0%` even during
-the active 297 W / 2400 MHz phase. The activity counter's sampling cadence
-appears to not track this kernel's burst pattern (each launch is ~0.43 ms;
-warmup phase queues 500 launches). The `SOCKET_POWER` and clock readings
-are reliable indicators of active state; `GFX_ACTIVITY` is not in this case.
+(Sidebar: `GFX_ACTIVITY` simultaneously read `0%` during these 2.4 GHz reads —
+a second misleading metric, for the same burst-launch-pattern reason. Power
+is the only `amd-smi` field that reliably distinguished active from idle
+here.)
 
-So the kernel is running at the **spec-max clock (2400 MHz)** at **~21% of
-TDP** (297 W of 1390 W). There's no power throttling and no clock cap
-binding.
+**The right way (per-wave cycles ÷ per-workgroup wall time):**
+- ATT records each wave's `duration` in sclk cycles (per `rocprof-trace-decoder`).
+- With occupancy 1, 1024 workgroups, 256 CUs ⇒ each CU runs 4 workgroups
+  sequentially, so per-workgroup time = kernel_time / 4 = 0.424/4 ≈ 106 µs.
+- Median per-wave duration in the trace: **156,516 cyc**.
+- Derived clock: 156,516 cyc / 106 µs = **1.477 GHz**.
+- Max-wave variant (the longest-running wave on the CU, which best
+  approximates the workgroup time): 163,100 cyc / 106 µs = 1.539 GHz.
 
-Per-cycle efficiency:
-- Achieved: 2553 TFLOPS / (2.4 GHz × 256 CUs × 4 SIMDs/CU) = **1038 flops/cyc/SIMD**
+So **achieved clock ≈ 1.45–1.54 GHz** — *not* 2.4 GHz. The per-cycle
+efficiency math at this clock is:
+- Achieved 2553 TFLOPS / (1.5 GHz × 256 CUs × 4 SIMDs/CU × 2048 flops/cyc/SIMD)
+  ≈ **81%** of peak.
+
+That's the sane number — almost identical to BF16 16x32's 78%. The 51%
+efficiency I'd computed against the (wrong) 2.4 GHz clock was the signal
+that the clock measurement itself was off, but I'd missed it.
+
+Per-cycle efficiency (using the cycle-derived ~1.5 GHz clock):
+- Achieved: 2553 TFLOPS / (1.5 GHz × 256 CUs × 4 SIMDs/CU) ≈ **1662 flops/cyc/SIMD**
 - Theoretical peak for `mfma_scale_f32_16x16x128_f8f6f4`: **2048 flops/cyc/SIMD**
-- **⇒ ~50.7% of per-cycle peak.**
+- **⇒ ~81% of per-cycle peak.**
 
-For comparison, BF16 16x32 hits ~78% of its (smaller) per-cycle peak. So the
-FP8 kernel achieves more raw TFLOPS but is structurally less efficient.
+That matches BF16 16x32's ~78% closely. The two kernels have very similar
+per-cycle scheduling efficiency; the 2× TFLOPS advantage of FP8 comes from
+the 2× per-cycle peak of the FP8 MFMA, not from a better schedule.
 
 ## ATT (one CU, fp8 main loop)
 
@@ -296,11 +317,15 @@ mapping is clean.
 
 ## Open questions
 
-1. **Why is the FP8 4-wave only at 51% of per-cycle peak when BF16 hits 78%?**
-   Possibilities: (a) the interleave isn't fully saturating the XDL, (b) load
-   latency dominates in a way the interleave can't hide, (c) the wave's
-   instruction issue queue can't sustain back-to-back MFMA + load issues at
-   the rate needed. Worth profiling specifically.
+1. **Why does the GPU not clock higher given the headroom?** The kernel only
+   draws 297 W (well below the 1390 W TDP) and runs at ~1.5 GHz, with the spec
+   max being 2.4 GHz. Some throttle is keeping it below peak that isn't power.
+   Possibilities: voltage/frequency curve limits at this DPM state, thermal
+   throttling, or DPM doesn't transition fully during burst workloads.
+   Empirical test: a custom driver that keeps the GPU 100% busy continuously
+   for several seconds and see if amd-smi reports a *different* (higher or
+   lower) clock + an accordingly different TFLOPS. If both move together,
+   it's DPM dynamics; if not, it's a hard limit.
 2. **Is the XDL pipelined for `mfma_scale_f32_16x16x128_f8f6f4`?** The ATT
    per-mfma cycles (~24) are lower than the 32-cyc spec, hinting at
    pipelining or measurement subtlety. Compare against running a tight
