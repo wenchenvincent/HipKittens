@@ -162,11 +162,11 @@ base_ptr, lds_base)`. Two effects:
 
 ## Loop body — 8 MMA blocks per source iteration
 
-`for (int tile = 0; tile < num_tiles - 2; tile += 2)` (line 136) — the loop is
+`for (int tile = 0; tile < num_tiles - 2; tile += 2)` (line 139) — the loop is
 **unrolled by 2** (covers 2 K-steps per source iteration), so:
 
-- 8 `mma_ABt` calls per source iteration (lines 148, 160, 171, 183, 196, 208,
-  219, 229) ⇒ **4 mma_ABts per K-step**, one for each `C_accum[i][j]`.
+- 8 `mma_ABt` calls per source iteration (lines 153, 167, 180, 194, 209, 223,
+  236, 248) ⇒ **4 mma_ABts per K-step**, one for each `C_accum[i][j]`.
 - 16 `s_barrier`s per source iteration ⇒ **8 LD/MMA phase boundaries per K-step**.
   Each LD phase loads one A or B half-tile + issues one global prefetch; each
   MMA phase is one `mma_ABt` call.
@@ -213,7 +213,7 @@ power, not the pipeline granularity, is what differs (see Headline).
 
 ### Prologue load order — not load-bearing (tested)
 
-The prologue (lines 116–119) issues `Bs[tic][0], As[tic][0], Bs[tic][1], As[tic][1]` in that order
+The prologue (lines 117–120) issues `Bs[tic][0], As[tic][0], Bs[tic][1], As[tic][1]` in that order
 — B-first per pair. Reasonable hypothesis: the loop's first `ds_read` consumes `Bs[0][0]`, and
 issuing B first lets it land in LDS earliest (if buffer-loads complete roughly FIFO), minimizing
 the loop's first stall.
@@ -230,7 +230,7 @@ load-bearing**.
 ### Fine-grained waitcnts
 
 The 16x32 kernel uses `s_waitcnt lgkmcnt(8)` and `vmcnt(N)` in places (lines
-143, 179, 191, 225, 262, 279, 290) where the 32x16 used only full drains:
+147, 189, 203, 243, 282, 300, 311) where the 32x16 used only full drains:
 
 - `s_waitcnt lgkmcnt(8)` — wait until at most 8 LDS ops are still outstanding.
   Keeps later ds_reads in flight to overlap with the upcoming MMA.
@@ -240,6 +240,34 @@ The 16x32 kernel uses `s_waitcnt lgkmcnt(8)` and `vmcnt(N)` in places (lines
 These are throughput-tuning, not correctness-load-bearing: the partial
 drain lets later memory ops continue while the wave issues compute. Whether
 the exact `N` is optimal is a profiler call.
+
+#### lgkmcnt(8) at LD0 of both K-steps — tested, no measurable effect
+
+The two `s_waitcnt lgkmcnt(8)` instructions (lines 147, 203) appear only at
+LD0 of each K-step — the two LD phases doing 12 ds_reads (4 for B + 8 for A)
+before their respective barriers. Other LD phases (with 4 or 8 ds_reads) skip
+the partial drain. Intuitively this might look like a phase-balance trick to
+lengthen the heavy LD phases to align with their MMA partners, but ATT
+measurement says it's mostly inert.
+
+**Tested at 8192³, MI355X, warm-state back-to-back:** removing both
+`lgkmcnt(8)` instructions ("V1") gives 1217.9 TFLOPS vs the baseline's 1216.4 —
+within the ~0.15% run-to-run noise floor. ATT shows the cycles redistribute:
+the LD segments containing the drain (seg0, seg8) lose ~2 cyc of wave-PC time
+and gain ~4 cyc of barrier wait, net ~zero. Total barrier-wait per loop iter
+drops 777 → 765 cyc (~12 cyc / ~0.3%); XDL utilization 91.6% → 92.1%. None of
+this is large enough to show up in wall-clock TFLOPS.
+
+Best reading: the drain's cycles get absorbed into the `s_barrier` wait that
+immediately follows. Without the explicit drain, the wave races to the barrier
+and parks there the same total time. The partial drains look vestigial in the
+current kernel state — possibly correct for a prior tuning iteration with a
+different phase balance, but inert here.
+
+Recommendation: leave them as-is. Removing them buys at most a sub-noise
+improvement, and the cost if some workload (different M/N/K, different MI3xx
+revision) shifts the balance is real. This is a tested null, not a green light
+to refactor.
 
 ## Per-cluster ATT measurements (`.claude/skills/gemm-att-analysis`)
 
