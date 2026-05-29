@@ -163,6 +163,37 @@ base_ptr, lds_base)`. Two effects:
 The schedule rotates through the 4 LDS half-tile buffers and the 2×2
 accumulator grid, with prefetches into `tic`-toc-swapped buffers interleaved.
 
+### Pipeline diagram (per K-step)
+
+8 alternating LD/MMA phases per K-step (vs 32x16's 4), each ~half as long.
+- `LD_k`: one `ds_read` of A or B half-tile + one `G::load` prefetch into the next toc.
+- `MMA_k`: one `mma_ABt` over a `C_accum[i][j]` = 16 mfmas of 16x16x32 ≈ 256 cyc.
+
+```
+phase:     p1     p2     p3     p4     p5     p6     p7     p8
+row0:    LD0  | MMA0 | LD1  | MMA1 | LD2  | MMA2 | LD3  | MMA3 |  ...
+row1:    (B1) | LD0  | MMA0 | LD1  | MMA1 | LD2  | MMA2 | LD3  | MMA3
+XDL:     idle | row0 | row1 | row0 | row1 | row0 | row1 | row0 |  ...
+mem:     row0 | row1 | row0 | row1 | row0 | row1 | row0 | row1 |  ...
+```
+
+Vertical = same wall-clock; `|` = `s_barrier` (all 8 waves meet). row1 is one phase behind via the
+`warp_row==1` prologue barrier (B1), same as 32x16. Each MMA phase: `s_setprio(1)` wraps it,
+`lgkmcnt(0)` before it; the next prefetch's `vmcnt` stays in flight and is drained at a later phase
+(the kernel uses partial `lgkmcnt(8)` / `vmcnt(N)` drains instead of full per-phase drains, so the
+exact placement varies — see the source for which phase each drain lives in).
+
+Resource accounting per K-step (single SIMD, both halves alternating):
+- XDL serves 4 row0 mma_ABts + 4 row1 mma_ABts = 8 × 16 mfmas × 16 cyc = **2048 cyc XDL-busy**.
+- Wall-clock per K-step ≈ **2236 cyc** (ATT).
+- XDL utilization ≈ **91.6%** — the ~9% gap is at the 8 phase boundaries (~24 cyc each).
+
+Compared to 32x16 (4 phases × 512 cyc), 16x32 doubles the number of phase boundaries (8 vs 4) but
+halves each MMA's wall-clock contribution (~256 vs ~512 cyc). Net XDL utilization is essentially
+the same (~91% either way) — the finer-grained pipeline doesn't penalize itself with extra
+boundary overhead, but it doesn't unlock more XDL-busy time either. The MFMA-shape's per-cycle
+power, not the pipeline granularity, is what differs (see Headline).
+
 ### Fine-grained waitcnts
 
 The 16x32 kernel uses `s_waitcnt lgkmcnt(8)` and `vmcnt(N)` in places (lines
