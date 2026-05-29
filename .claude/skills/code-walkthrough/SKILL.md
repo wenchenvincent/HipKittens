@@ -49,6 +49,11 @@ Each turn of a walkthrough follows the same shape:
 - Sampled GPU 0's clock for several rounds and got idle-clock numbers. The actual work was on GPU 3 (`cuda:0` mapped to physical 3 on that node).
 - **Fix:** never assume the device you're sampling matches the device doing work. Confirm via activity/power before reporting a number from any device-specific tool.
 
+### Cold-state benchmark outliers in cross-kernel comparisons
+- Reported "16x32 is 8.6% faster than 32x16" based on numbers measured at different times in the session. Back-to-back warm-GPU re-bench: same kernel jumped from 1192.6 to 1217.3 TFLOPS — the original 1192.6 was a cold-state outlier. With both kernels measured immediately back-to-back from the same warm state, the real gap is ~10.9%, which makes the clock-ratio arithmetic (13.8% clock ⇒ ~11% TFLOPS) cleaner than I'd hand-waved.
+- **Fix:** for any cross-kernel TFLOPS comparison, measure back-to-back in the same script invocation with the GPU already warm — same 50-iter warmup + 200-iter timing for both, kernels alternated without GPU idle in between. Treat any number measured against a different thermal state as an *upper bound on uncertainty*, not a real comparison. The fingerprint of a cold-state outlier: the same kernel re-measured immediately gives a noticeably different number.
+- This also generalizes: any **stateful resource** (caches, branch predictors, power state, frequency, link state) can leak across runs and dirty cross-condition comparisons. Same-state back-to-back is the universal fix.
+
 ### Incomplete diagrams that hide the actual mechanism
 - Drew a "ping-pong overlap" picture showing only row0's clusters. The user pointed out row1's c1 MMA happens during row0's c2 loads on the *same* XDL. The "loads hidden under compute" framing collapsed into a sharper "XDL is a shared resource; both halves alternate feeding it at ~100% duty."
 - **Fix:** when a diagram has multiple actors, draw all of them. If you find yourself describing "what one wave does," ask whether the model needs the others to be complete.

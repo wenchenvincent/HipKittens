@@ -18,13 +18,24 @@ the surprising performance finding.
 
 ## Headline
 
-**16x32 runs 1192.6 TFLOPS vs 32x16's 1097.8 — about 8.6% faster — but
+**16x32 runs 1217.3 TFLOPS vs 32x16's 1098.2 — about 10.9% faster — but
 the per-K-step compute cycles, per-K-step wall-clock cycles, and steady-state
 XDL utilization are essentially identical between the two kernels.** The
 speedup is almost entirely **clock-driven**: 16x32 sustains ~1.48 GHz under the
-TDP cap vs 32x16's ~1.30 GHz. The hypothesis (consistent with the data, not
+TDP cap vs 32x16's ~1.30 GHz (a ~13.8% clock ratio, vs 10.9% TFLOPS — the ~3%
+discount is consistent with memory latency that doesn't scale with clock,
+e.g. the 196-cyc c2 `s_waitcnt(0)` drain becoming a larger fraction of K-step
+wall-clock at the higher clock). The hypothesis (consistent with the data, not
 independently confirmed): 16x16x32 mfmas are lower-power per cycle than
 32x32x16, so the power-capped GPU can clock higher running the smaller shape.
+
+> Benchmark methodology note: these are warm-GPU back-to-back measurements
+> (32x16 immediately before 16x32, both at 200 iters with 50-iter warmup).
+> An earlier draft of this doc reported the 16x32 number as 1192.6 TFLOPS
+> — that was a cold-state outlier (first run after the GPU had been idle).
+> Same kernel, warm: 1217.3. Cross-kernel comparisons need same thermal
+> state, or the difference you measure is partly the warm-up curve, not the
+> kernels.
 
 ## A/B/C orientation
 Identical to 32x16: C = A·Bᵀ, A=(M,K), B=(N,K) row-major bf16 in HBM, C=(M,N),
@@ -194,6 +205,22 @@ the same (~91% either way) — the finer-grained pipeline doesn't penalize itsel
 boundary overhead, but it doesn't unlock more XDL-busy time either. The MFMA-shape's per-cycle
 power, not the pipeline granularity, is what differs (see Headline).
 
+### Prologue load order — not load-bearing (tested)
+
+The prologue (lines 116–119) issues `Bs[tic][0], As[tic][0], Bs[tic][1], As[tic][1]` in that order
+— B-first per pair. Reasonable hypothesis: the loop's first `ds_read` consumes `Bs[0][0]`, and
+issuing B first lets it land in LDS earliest (if buffer-loads complete roughly FIFO), minimizing
+the loop's first stall.
+
+**Tested at 8192³ (MI355X, warm GPU, back-to-back):** swapping to A-first
+(`As[tic][0], Bs[tic][0], As[tic][1], Bs[tic][1]`) gives 1217.5 TFLOPS vs the B-first baseline's
+1216.7 — **within 0.07% (noise)**, both correct. So the consumption-order hypothesis doesn't hold
+at this scale; whatever ensures correctness for B-first works for A-first too. By the time the
+loop's first `ds_read` actually executes, evidently all four prologue buffer_loads have retired
+regardless of issue order — likely because the prologue's `s_barrier`s + subsequent loads provide
+plenty of overlap cycles for the early DMAs to land. So **the prologue order is stylistic, not
+load-bearing**.
+
 ### Fine-grained waitcnts
 
 The 16x32 kernel uses `s_waitcnt lgkmcnt(8)` and `vmcnt(N)` in places (lines
@@ -253,16 +280,18 @@ per-K-step compute (1024 cyc both ways), same per-K-step wall-clock
 same TFLOPS.
 
 But they don't run at the same clock. Sampled `amd-smi metric` on GPU 3
-(the busy device) under sustained load:
+(the busy device) under sustained load, with warm-GPU back-to-back TFLOPS:
 
 | kernel | sustained GFX_CLK | SOCKET_POWER | achieved TFLOPS |
 |--------|------------------:|-------------:|----------------:|
-| 32x16  | ~1.30 GHz          | ~1388 W      | 1097.8          |
-| 16x32  | ~1.48 GHz          | ~1390 W      | 1192.6          |
+| 32x16  | ~1.30 GHz          | ~1388 W      | 1098.2          |
+| 16x32  | ~1.48 GHz          | ~1390 W      | 1217.3          |
 
-Same power budget; ~14% higher clock on 16x32. TFLOPS ratio 1.087 ≈ a
-discounted clock ratio (some loss to per-K-step constants that don't scale
-with clock — global-load latency in particular).
+Same power budget; ~13.8% higher clock on 16x32. TFLOPS ratio 1.108 ≈ a
+slightly discounted clock ratio. The ~3% discount lines up with per-K-step
+constants that don't scale with clock — chiefly the global-load latency
+captured in c2's `s_waitcnt(0)` drain (~196 cyc/wave/iter on 32x16) which
+becomes a larger fraction of K-step wall-clock at the higher clock.
 
 **Working hypothesis (not independently confirmed):** 16x16x32 mfmas are less
 power-intensive per cycle than 32x32x16 (smaller per-mfma data path, fewer
@@ -287,11 +316,9 @@ non-power-capped configuration. Out of scope for this walkthrough.
 
 ## Open questions (not resolved here)
 
-- **Why does the 14% clock gap only translate to 8.6% TFLOPS?** Per-K-step
-  global-load latency (~196 cyc on c2's `s_waitcnt(0)` drain on 32x16) doesn't
-  shrink with clock; at higher clock it's a larger fraction of K-step
-  wall-clock. Could explain the ~5% discount, but I haven't computed it
-  rigorously.
+- **Quantifying the ~3% clock-vs-TFLOPS discount.** Hand-wavy explanation
+  matches the magnitude (memory latency doesn't scale with clock), but
+  a per-cluster cycle decomposition at each clock would confirm rigorously.
 - **Are the 16x32 per-MFMA stall numbers (~75%) lower than 32x16's (~86%)
   because of pipelining or because of a tighter MMA-cluster schedule?**
   Single-occupancy holds for both shapes per the ATT signature, so this is
