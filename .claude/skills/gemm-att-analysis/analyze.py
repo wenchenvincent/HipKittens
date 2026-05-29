@@ -63,12 +63,17 @@ def load_rows(csv_path):
 
 
 def detect_loop_hits(rows):
-    """Loop body = the largest non-zero Hitcount with enough instructions to be a
-    real cluster (≥ 5). The MAX hitcount picks "ran most times" = the loop body,
-    distinct from prologue/epilogue (hitcount ≈ num_waves)."""
+    """Loop body = the hitcount that accounts for the most total executions
+    (hitcount × num_instructions). This robustly picks the loop body whether
+    it has many instructions per iter (BF16 ping-pong: 4064 hits × 125 instrs
+    = 508K dominates 32 × 736 = 23K) or many iterations on fewer instructions
+    (FP8 4-wave: 148 hits × 4761 instrs = 705K dominates 2048 × 23 = 47K).
+    Requires ≥ 5 instructions to filter outliers."""
     hc = Counter(h for _, _, h, _, _ in rows)
-    candidates = [h for h in hc if h > 0 and hc[h] >= 5]
-    return max(candidates) if candidates else 0
+    candidates = [(h, hc[h]) for h in hc if h > 0 and hc[h] >= 5]
+    if not candidates:
+        return 0
+    return max(candidates, key=lambda x: x[0] * x[1])[0]
 
 
 def segment_loop(rows, loop_hit):
