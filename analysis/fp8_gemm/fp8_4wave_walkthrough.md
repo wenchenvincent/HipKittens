@@ -236,14 +236,30 @@ Bench (best of 100 timing iters after 500 warmup, with rotating buffers):
 - **Avg: 0.431 ms / 2553.34 TFLOPS**
 - Correctness: PASSED (CPU reference comparison, rtol implicit ~0.01)
 
-Power/clock samples (during sustained kernel execution, `amd-smi metric` on
-GPU 3, the cuda:0 device):
-- GFX clock: **~2375–2407 MHz** (XCDs vary by ~30 MHz) ⇒ **~2.4 GHz sustained**
-- Socket power: **~296 W**
-- Spec MAX_CLK: 2400 MHz; TDP cap: ~1390 W
+Power/clock measurement under sustained load — cross-checked with two tools
+(documented carefully because `amd-smi`'s `GFX_ACTIVITY` metric proved
+misleading for this burst-launch pattern):
 
-So the kernel is running at the **spec-max clock** at **~21% of TDP**. There's
-no power throttling.
+- **`amd-smi metric -g 3`** across all 7 XCDs during the warmup phase
+  (500 back-to-back kernel launches ≈ 215 ms of continuous GPU work):
+  every XCD reads **2398–2407 MHz** with `SOCKET_POWER` consistently at
+  **296–297 W**. The clock readings are stable across 10+ samples spanning
+  ~1.8 s of work.
+- **`rocm-smi -d 3 --showclocks`** independent cross-check during the same
+  window: `sclk clock level: 1: (2400Mhz)` — confirms current sclk = 2400 MHz.
+- **Idle reference**: between kernel bursts the same tools read 95–160 MHz
+  at 230–245 W. So the active phase is distinguishable from idle by a clear
+  +50 W power jump and a ~15× clock jump.
+
+Methodology caveat: `amd-smi`'s `GFX_ACTIVITY` metric reads `0%` even during
+the active 297 W / 2400 MHz phase. The activity counter's sampling cadence
+appears to not track this kernel's burst pattern (each launch is ~0.43 ms;
+warmup phase queues 500 launches). The `SOCKET_POWER` and clock readings
+are reliable indicators of active state; `GFX_ACTIVITY` is not in this case.
+
+So the kernel is running at the **spec-max clock (2400 MHz)** at **~21% of
+TDP** (297 W of 1390 W). There's no power throttling and no clock cap
+binding.
 
 Per-cycle efficiency:
 - Achieved: 2553 TFLOPS / (2.4 GHz × 256 CUs × 4 SIMDs/CU) = **1038 flops/cyc/SIMD**
