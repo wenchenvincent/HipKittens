@@ -57,6 +57,64 @@ the kernel issues **2× more `mma_ABt` calls per K-step** (4 vs 2). Compute time
 per K-step ends up identical: 32x16 = 32 mfmas × 32 = 1024 cyc, 16x32 =
 64 mfmas × 16 = 1024 cyc.
 
+### row_l / col_l register layout (16x32 shapes)
+
+(Background and caveats: see the [32x16 walkthrough's row_l/col_l section](8wave_pingpong_walkthrough.md#row_l--col_l--mfma-register-layout)
+— same meaning, just different per-lane counts because the MFMA shapes are smaller.)
+
+**Counts:**
+- A/B input `rt_16x32_s`: 16 × 32 = 512 bf16 / 64 lanes = **8 bf16/lane**, row_l.
+  (Same count as 32x16's `rt_32x16`, just shaped differently: K is wider per lane, M is narrower.)
+- C accum `rt_16x16_s`: 16 × 16 = 256 fp32 / 64 lanes = **4 fp32/lane**, col_l.
+  (Quarter of 32x16's 16 fp32/lane — same fraction smaller as the accumulator dims, 16² vs 32².)
+
+**row_l layout (operands) — K contiguous in a lane:**
+
+```
+A_tile / B_tile sub-tile rt_16x32 (16 M-rows × 32 K-cols, 8 bf16/lane)
+
+         K cols (0..31) →
+       ┌── 8 ──┬── 8 ──┬── 8 ──┬── 8 ──┐
+M=0    │ lane0 │ lane1 │ lane2 │ lane3 │   4 lanes per M row;
+M=1    │ lane4 │ lane5 │ lane6 │ lane7 │   16 rows × 4 = 64 lanes ✓
+ ...   │  ...  │  ...  │  ...  │  ...  │   each lane holds 8 bf16 along K.
+M=15   │ lane60│ lane61│ lane62│ lane63│
+       └───────┴───────┴───────┴───────┘
+           ↑
+      Wider K (32 vs 32x16's 16) ⇒ 4 lanes per row instead of 2.
+      The reduction axis is still "fast within a lane".
+```
+
+**col_l layout (accumulator) — M and N share the lane's elements:**
+
+```
+C_accum sub-tile rt_16x16 (16 M-rows × 16 N-cols, 4 fp32/lane)
+
+         N cols (0..15) →
+       ┌─ 4 ─┬─ 4 ─┬─ 4 ─┬─ 4 ─┐
+M=0..3 │ l0  │ l1  │ l2  │ l3  │   each lane: 4 fp32 elements
+M=4..7 │ l4  │ l5  │ l6  │ l7  │   in a 4-row × 1-col slice
+ ...   │     │     │     │     │   (conceptual; exact lane→block
+M=12..15│l60 │ l61 │ l62 │ l63 │    mapping per the MFMA spec).
+       └─────┴─────┴─────┴─────┘
+   16 M-blocks × 4 N-blocks × 1 lane/block = 64 lanes ✓
+   4 fp32/lane × 64 = 256 ✓
+```
+
+> Same caveat as the 32x16 doc: the diagrams show the per-lane count and "fast axis," not the exact
+> MFMA-ISA bit positions. CDNA MFMA outputs are interleaved across multiple row-blocks; the precise
+> formula is in the AMD MFMA spec. The point of the diagram is that you can read off register
+> pressure, the count of independent accumulators per warp, and which axis a later op contracts
+> along — the bit-exact lane mapping isn't needed for those reasoning steps.
+
+**Compared to 32x16:** A/B input layout has the same 8 bf16/lane but covers a wider K per lane
+(32 vs 16), so a single sub-tile contracts more K per MFMA — paid for by the smaller M (16 vs 32).
+The accumulator is one-quarter the size (256 vs 1024 fp32), so each lane holds only 4 fp32 instead
+of 16, but there are **32 such accumulator sub-tiles per warp** (4 `C_accum[i][j]` × (4 × 2)
+sub-tiles each) vs **8** in the 32x16 variant. More, smaller accumulators ⇒ finer-grained
+dependency graph but more VGPRs to keep them all live (the build report does show 210 VGPRs for
+16x32 vs 200 for 32x16).
+
 ## Shared memory: split into M-halves
 The 256-row M block is held in LDS as **two 128-row halves**:
 - `As[2][2]` and `Bs[2][2]` (lines 44–45). Outer `[2]` = tic/toc; inner `[2]` =

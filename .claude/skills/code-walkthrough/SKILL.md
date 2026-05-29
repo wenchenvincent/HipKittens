@@ -53,6 +53,15 @@ Each turn of a walkthrough follows the same shape:
 - Drew a "ping-pong overlap" picture showing only row0's clusters. The user pointed out row1's c1 MMA happens during row0's c2 loads on the *same* XDL. The "loads hidden under compute" framing collapsed into a sharper "XDL is a shared resource; both halves alternate feeding it at ~100% duty."
 - **Fix:** when a diagram has multiple actors, draw all of them. If you find yourself describing "what one wave does," ask whether the model needs the others to be complete.
 
+### Explaining a tensor-core / MFMA op without showing the register layout
+- Talked about "row_l / col_l" for register tiles abstractly, then later had to scramble to ground claims about register pressure and which layout the next op consumes. Without a layout diagram, the reader (and you) can't see why a particular `mma_ABt` chain works, why one variant uses more VGPRs than another, or why `store` un-transposes back to `gl`.
+- **Fix:** when an MFMA / tensor-core / matrix-unit shape appears in a walkthrough, include a layout sketch covering:
+  - The per-lane element count for each operand and the accumulator (compute `shape_rows × shape_cols / wave_size` so the math is visible).
+  - Which axis is "fast" inside one lane (`row_l` = the reduction axis K; `col_l` = the output M axis on AMD CDNA).
+  - A small 2-D box drawing showing lanes tiling the sub-tile shape. Mark it as **conceptual** — the exact lane-to-element bit positions are MFMA-ISA-specific (often interleaved row-blocks); the diagram is for register-pressure / dataflow reasoning, not bit-exact reverse engineering.
+  - Reference numbers worth deriving alongside: number of accumulator sub-tiles per warp (`reg_tile_rows / shape_rows × reg_tile_cols / shape_cols`), cycles-per-MFMA from the matrix-instruction calculator or LLVM `SISchedule.td`, and per-K-step total flops (`mfmas/cluster × cycles × utilization × clock`).
+- Example diagrams in the HK BF16 GEMM walkthroughs (`analysis/bf16_gemm/8wave_pingpong_walkthrough.md` for 32x16 shapes; `16x32_walkthrough.md` for the smaller-shape sibling). The two side-by-side show what "different MFMA shape" actually means at the lane level — useful pedagogy for explaining shape tradeoffs.
+
 ## Artifacts a walkthrough should leave behind
 
 - **A reference doc** in the repo's analysis/ tree, version-controlled, structured as: data layout → mechanism → empirical numbers → explicit caveats for things not fully explained. Update it as understanding evolves — show the corrections.

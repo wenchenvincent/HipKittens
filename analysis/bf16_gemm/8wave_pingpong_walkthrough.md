@@ -25,12 +25,55 @@ Bᵀ stored row-major, C=(M,N). bench calls dispatch_micro with transpose_B=True
   needs `64/16 = 4` MFMAs → **8 × 4 = 32 MFMAs per warp per K-step** (16 per cluster).
 - Lanes: 32×32 = 1024 / 64 = 16 fp32 per lane = `floatx16`.
 
-### row_l / col_l = MFMA operand layout
-Not host memory order — which lane holds which element for the MFMA registers. `reductions = row?
-cols : rows` (rt_base.cuh:66), so K runs along cols for row_l, rows for col_l. Counts (32x16 variant):
-A/B `rt_32x16_s` = 512/64 = 8 bf16/lane in row_l (inputs); C `rt_32x32_s` = 1024/64 = 16 fp32/lane in
-col_l (mfma writes result transposed). store un-transposes back to gl. 16x16/16x16x32 only on the
-16x32 sibling. Pick layout = what the next MFMA produces/consumes, not memory.
+### row_l / col_l = MFMA register layout
+Not host memory order — which lane holds which element for the MFMA registers.
+`reductions = row ? cols : rows` (rt_base.cuh:66), so K runs along cols for row_l, rows for col_l.
+Pick layout = what the next MFMA produces/consumes, not what's in memory.
+
+**Counts for the 32x16 variant:**
+- A/B input `rt_32x16_s`: 32 × 16 = 512 bf16 / 64 lanes = **8 bf16/lane**, row_l.
+- C accum `rt_32x32_s`: 32 × 32 = 1024 fp32 / 64 lanes = **16 fp32/lane**, col_l.
+
+**row_l layout (operands) — K contiguous in a lane:**
+
+```
+A_tile rt_32x16 (32 M-rows × 16 K-cols, 8 bf16/lane)
+
+         K cols (0..15) →
+       ┌──── 8 ────┬──── 8 ────┐
+M=0    │  lane 0   │  lane 1   │   2 lanes per M row;
+M=1    │  lane 2   │  lane 3   │   32 rows × 2 = 64 lanes ✓
+ ...   │   ...     │   ...     │   each lane holds 8 bf16 along K.
+M=31   │  lane 62  │  lane 63  │
+       └───────────┴───────────┘
+            ↑
+       lane's elements lie along K (the reduction axis) → "row_l".
+       MFMA contracts along K within a lane + across the 2 K-groups.
+```
+
+**col_l layout (accumulator) — M ends up contiguous in a lane:**
+
+```
+C_accum rt_32x32 (32 M-rows × 32 N-cols, 16 fp32/lane)
+
+         N cols (0..31) →
+       ┌─ 4 ─┬─ 4 ─┬─ 4 ─┬─ 4 ─┬─ 4 ─┬─ 4 ─┬─ 4 ─┬─ 4 ─┐
+M=0..3 │ l0  │ l1  │ l2  │ l3  │ l4  │ l5  │ l6  │ l7  │
+M=4..7 │ l8  │ l9  │ ... │     │     │     │     │     │
+ ...   │                                                  │
+       └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+   each lane: 16 fp32 spanning 4 N-cols × 4 M-row-stripes
+   (M is the "fast" axis the wave can later reduce over → "col_l").
+```
+
+> The boxes show the conceptual mapping (per-lane count + fast axis), not the exact MFMA-ISA bit
+> positions — CDNA MFMA outputs are interleaved across multiple 4-row blocks per lane, and the
+> precise lane→element formula is in the AMD MFMA spec. Use this to reason about register pressure
+> and which layout follows which op; reach for the spec when you need exact bit positions.
+
+In this kernel: A/B come from `ds_read` into `row_l` (matching what `mfma_f32_32x32x16_bf16` reads);
+MFMA writes the result in `col_l`; `store` un-transposes back to row-major `gl`. The 16x32 sibling
+uses the smaller 16x16x32 MFMA shape with different lane counts (see its walkthrough).
 
 ## mma_ABt nesting (include/ops/warp/register/tile/mma.cuh:445)
 4×2×2 unrolled: `n<D::height`(4 M) × `m<D::width`(2 N) × `k<A::width`(2 per 32-wide cluster).
