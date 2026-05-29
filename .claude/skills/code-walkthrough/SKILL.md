@@ -53,6 +53,19 @@ Each turn of a walkthrough follows the same shape:
 - Reported "16x32 is 8.6% faster than 32x16" based on numbers measured at different times in the session. Back-to-back warm-GPU re-bench: same kernel jumped from 1192.6 to 1217.3 TFLOPS — the original 1192.6 was a cold-state outlier. With both kernels measured immediately back-to-back from the same warm state, the real gap is ~10.9%, which makes the clock-ratio arithmetic (13.8% clock ⇒ ~11% TFLOPS) cleaner than I'd hand-waved.
 - **Fix:** for any cross-kernel TFLOPS comparison, measure back-to-back in the same script invocation with the GPU already warm — same 50-iter warmup + 200-iter timing for both, kernels alternated without GPU idle in between. Treat any number measured against a different thermal state as an *upper bound on uncertainty*, not a real comparison. The fingerprint of a cold-state outlier: the same kernel re-measured immediately gives a noticeably different number.
 - This also generalizes: any **stateful resource** (caches, branch predictors, power state, frequency, link state) can leak across runs and dirty cross-condition comparisons. Same-state back-to-back is the universal fix.
+- Even within one session, thermal state shifts. A baseline number from 30 minutes ago in the same session is just as suspect as a number from yesterday. The rule isn't "warm vs cold" — it's "measured in the same back-to-back invocation as the experiment."
+
+### Treating plausible scheduling hypotheses as established without testing
+- The 16x32 BF16 GEMM has `s_waitcnt lgkmcnt(8)` at two specific blocks. Asked why, I offered "could be phase-balance — lengthen the heavy LD phase to match its MMA partner." It sounded reasonable, fit the structure, and matched a known hand-tuning pattern. Empirical test (V1 = removed both): no measurable TFLOPS effect, ATT shows cycles redistribute into the adjacent `s_barrier` wait. The drain was essentially vestigial — possibly correct in a prior tuning iteration, inert in the current code. The "phase balance" story was wrong.
+- **Fix:** plausible-sounding scheduling explanations need the same empirical skepticism as plausible-sounding correctness explanations. Hand-scheduled kernels accumulate vestigial pieces from earlier tuning passes — code that looks meaningful but isn't load-bearing. If the question is "why is this here?" and you can run a 10-min control experiment, run it before committing to a story. The common outcome of these experiments is "tested null, leave it alone" — that's a valuable answer too.
+
+### Counting units left implicit when discussing unrolled loops
+- The 16x32 source loop is unrolled by 2 (`tile += 2`). It has 16 `s_barrier`s and 8 `mma_ABt`s per source iteration. The pipeline diagram shows 8 phases per K-step. Both counts are correct, just at different granularities — but if you only state one, the reader counts the other and gets confused.
+- **Fix:** when discussing any loop that's unrolled by N (or that contains nested structure), explicitly state the counting unit ("per K-step" vs "per source iteration") at the start of each enumeration. Off-by-N traps are easy to spot for the writer, invisible to the reader, and corrosive to trust once found. Same discipline applies to per-wave vs per-workgroup, per-CU vs per-GPU, per-iter vs per-kernel.
+
+### Letting the "what I'd do next" section rot as speculation
+- Walkthrough docs that end with "future work" lists tend to ossify. The list becomes hand-waving cover for "I didn't finish." When the same future-work item gets asked about months later, the answer should be: done with result, explicitly blocked with reason, or deferred with rationale — never just left there.
+- **Fix:** treat the future-work list as a TODO with concrete commitments. When working on it, mark each item with one of those three outcomes. "Blocked because rocm-smi --setpoweroverdrive needs root" is a better answer than a speculative bullet that stays around forever — and it tells the next reader (or you) where to push if the access situation changes.
 
 ### Incomplete diagrams that hide the actual mechanism
 - Drew a "ping-pong overlap" picture showing only row0's clusters. The user pointed out row1's c1 MMA happens during row0's c2 loads on the *same* XDL. The "loads hidden under compute" framing collapsed into a sharper "XDL is a shared resource; both halves alternate feeding it at ~100% duty."
@@ -79,6 +92,31 @@ Each turn of a walkthrough follows the same shape:
 If the user asks something you genuinely can't answer from the available evidence:
 - Say so plainly, and propose the experiment that would answer it ("would need per-wave ATT traces, not the aggregate CSV").
 - Don't invent a plausible story to fill the gap. A clean "I don't know, here's what we'd need to find out" is far more useful than a confident wrong answer that survives until it breaks something downstream.
+
+## Patterns that worked
+
+These are positive methodological patterns that came out of this session, worth reaching for in future walkthroughs.
+
+### Pair every "why is this coded this way?" with a control experiment if it's cheap
+The session ran ~5 control experiments (prologue order swap, LDS-read order swap, c2→c3 drain move, lgkmcnt(8) removal, etc.). Each was a ~10-minute round trip: copy the file, edit one thing, build, verify correctness, bench warm-back-to-back. Cumulatively they overturned three of my "plausible mechanism" stories — and produced clean tested-null results that prevented future re-litigation. When the explanation cost is a few-minute build/bench loop, run it before committing to the explanation. The cost of speculation that survives one round of evidence is much higher than the cost of one experiment.
+
+### Indirect metrics when the direct test is blocked by privilege/access
+The clock-driven hypothesis ("16x32 wins because lower per-cycle power → higher sustained clock") was blocked from direct verification because `rocm-smi --setpoweroverdrive` and `--setperflevel` needed root and were silently no-op without. Indirect path that *did* work: compute **flops per cycle per SIMD** (`achieved_TFLOPS / (clock × num_SIMDs)`) for each kernel. That's a *clock-independent* efficiency number; if both kernels match there, the only thing left to differ is the clock — which is exactly the claim. Both came in at ~80% of theoretical peak per cycle (825 and 803 flops/cyc/SIMD); same per-cycle efficiency, different clock, math closes.
+- **Generalize:** when a direct controlled experiment is blocked, look for clock-independent / capacity-independent / size-independent transformations of the measured numbers that reduce the question to one you *can* answer. Per-cycle, per-byte, per-flop, per-thread are common.
+
+### Source annotations and doc line refs evolve together
+Adding `// Block N`-style comments to a heavily hand-scheduled source file is genuinely useful for the next reader — but it shifts line numbers, breaking every line ref in the analysis doc. Two disciplines worth using:
+- **If you add source annotations, update the doc's line refs in the same commit.** The diff stays self-consistent.
+- **Prefer semantic anchors over line numbers in docs** ("the c2 `s_waitcnt(0)` drain" beats "line 113") when the kernel has stable enough labels. Line refs are precise but fragile; semantic anchors survive refactors.
+
+## Tooling notes (gotchas worth remembering)
+
+These extend the shopping list below — same tools, but specific failure modes that wasted time in this session.
+
+- **`rocprofv3 --att --att-target-cu N` core-dumps at high CU IDs** (saw crashes at CU 31, 100, 200; CU 0/5/15 worked). Likely the decoder's CU id range is per-XCD or otherwise limited. Start with low CU IDs. Verifying per-CU generalization with two low IDs (e.g. 0 and 5) is usually enough.
+- **`rocm-smi --setpoweroverdrive` and `--setperflevel` silently no-op without root.** No error returned, but the actual state doesn't change. Always re-query (`--showpower`, `--showperflevel`) to confirm the requested change took effect.
+- **`amd-smi metric` per-GPU sampling needs the right device id**: `cuda:0` rarely maps to `amd-smi -g 0` on multi-GPU nodes. Sample all GPUs and look for the one at high `GFX_ACTIVITY` and near-TDP `SOCKET_POWER` — that's where the work is.
+- **ATT decoder library is a separate install:** the base ROCm ship's the collector (`libatt_plugin.so`) but not the decoder. Install `rocprof-trace-decoder` from the AMD GitHub release for the OS that matches the container (e.g. `ubuntu-24.04`). Extract with `dpkg-deb -x` to avoid touching system package state, then pass the directory via `--att-library-path`.
 
 ## Tooling shopping list
 
