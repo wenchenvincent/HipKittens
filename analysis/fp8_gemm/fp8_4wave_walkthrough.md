@@ -191,6 +191,52 @@ placed boundaries. There is **no `s_barrier` inside `do_interleaved_cluster`**
 — the synchronization is at the *instruction-issue* level within one wave,
 not cross-wave.
 
+### Pipeline diagram (per K-step)
+
+```
+All 4 warps run identical code in lockstep (no warp_row stagger).
+Each warp interleaves mma + load instructions in its OWN stream.
+Both the XDL and the memory pipe stay busy WITHIN each warp.
+
+per K-step:
+  ┌─ cluster 0 ─────────────┐ ┌─ cluster 1 ─────────────┐ ┌─ cluster 2 ─────────────┐ ┌─ cluster 3 ─────────────┐
+  │ do_interleaved_cluster   │ │ do_interleaved_cluster   │ │ do_interleaved_cluster   │ │ do_interleaved_cluster   │
+  │   → C[0][0]              │ │   → C[0][1]              │ │   → C[1][0]              │ │   → C[1][1]              │
+  │   16 mfmas + ~9 loads    │ │   16 mfmas + ~9 loads    │ │   16 mfmas + ~9 loads    │ │   16 mfmas + ~9 loads    │
+  └──────────────────────────┘ └──────────────────────────┘ └──────────────────────────┘ └──────────────────────────┘
+   waitcnt(vmcnt 16, lgkm 0)     waitcnt(lgkm 0)             waitcnt(vmcnt 16, lgkm 0)     waitcnt(lgkm 0)
+   + s_barrier (all 4 waves)      no barrier                  + s_barrier                    no barrier
+
+Inside one cluster (one warp's instruction stream, 16 mfmas + 9 loads):
+
+  issue:  m1 . . m2 LD LD m3 LD m4 LD LD m5 m6 LD m7 m8 LD LD m9 m10 LD m11 m12 LD LD m13 m14 LD m15 m16
+                          ↑           ↑              ↑              ↑               ↑
+                       (each mma busies the XDL ~32 cyc; chained mma waits for prev to retire)
+
+  XDL:    ████████████████████████████████████████████████████████████████████████████████████████████
+          (single-occupancy MFMA pipeline: ~32 cyc per chained mfma ⇒ ~16 × 32 = 512 cyc cluster floor)
+
+  mem:           ░░ ░░     ░░     ░░ ░░     ░░       ░░          ░░ ░░       ░░    ░░ ░░
+          (buffer_load + ds_read issued between mmas; run async on the memory pipe in parallel)
+```
+
+Contrast with **BF16 8-wave ping-pong** to see the structural difference:
+
+```
+BF16 8-wave (spatial overlap, two warp-rows alternate):
+  row0:  c0 LD | c1 MMA | c2 LD | c3 MMA | c0 LD | c1 MMA …
+  row1:        | c0 LD  | c1 MMA| c2 LD  | c3 MMA| c0 LD …    (1 phase behind via B1)
+  XDL:   idle  | row0   | row1  | row0   | row1  | row0  …    (fed by alternating halves)
+
+FP8 4-wave (temporal overlap, all warps lockstep):
+  warp0: m m L m L m L L m m L m m L L m m L m L m m L L m m L m L m m L L m m
+  warp1: m m L m L m L L m m L m m L L m m L m L m m L L m m L m L m m L L m m  (lockstep)
+  warp2: m m L m L m L L m m L m m L L m m L m L m m L L m m L m L m m L L m m
+  warp3: m m L m L m L L m m L m m L L m m L m L m m L L m m L m L m m L L m m
+  Each SIMD has exactly 1 warp (occupancy 1) → each XDL fed by its own warp's mma stream;
+  loads on memory pipe run async in parallel with that warp's own ongoing mma.
+```
+
 **Why this works for FP8 specifically:**
 
 1. The FP8 MFMA covers K=128 in one shot, so there are *fewer* MFMAs per
