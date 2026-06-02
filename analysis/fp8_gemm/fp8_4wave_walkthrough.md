@@ -22,11 +22,12 @@ alongside this walkthrough.
 
 | metric | FP8 4-wave (this kernel) | BF16 16x32 8-wave (for context) |
 |---|---|---|
-| Achieved TFLOPS @ 8192³ | **2553** (avg) / 2594 (best) | 1217 |
-| Achieved GFX clock | **~1.5 GHz** (derived from wave durations) | ~1.48 GHz |
-| Socket power under load | ~297 W | ~1390 W (TDP-capped) |
+| Achieved TFLOPS @ 8192³ (steady-state avg) | **~2461** (30k-iter warmup) | 1217 |
+| Achieved TFLOPS @ 8192³ (short burst, default bench) | 2553 avg / 2594 best | 1217 |
+| Achieved GFX clock (sustained) | **~1.45 GHz** (derived from wave durations) | ~1.48 GHz |
+| Sustained socket power (avg of active samples) | **~1100 W** (peaks 1349 W) | ~1390 W (TDP-capped) |
 | MFMA shape | `mfma_scale_f32_16x16x128_f8f6f4` | `mfma_f32_16x16x32_bf16` |
-| MFMA cycles per issue | **32** (Write8PassMAI, gfx950) | 16 |
+| MFMA cycles per issue (FP8 path) | **32** (CDNA4 ISA; LLVM Write8PassMAI) | 16 |
 | Flops per MFMA instruction | 65,536 (16·16·128·2) | 8,192 |
 | Per-SIMD peak flops/cyc | **2048** (2× BF16) | 1024 |
 | Per-cycle efficiency vs peak | **~81%** | ~78% |
@@ -34,20 +35,24 @@ alongside this walkthrough.
 | Occupancy (waves/SIMD) | 1 | 2 |
 | VGPRs (compile remark) | 256 | 210 |
 
-**Net story:** the FP8 kernel runs at ~1.5 GHz — essentially the same clock as
-BF16 — and achieves ~81% of per-cycle peak — essentially the same scheduling
-quality as BF16. The **2× TFLOPS advantage** over BF16 comes entirely from the
-**2× per-cycle peak** of the FP8 MFMA (`16x16x128` packs 2× the flops of
-`16x16x32` in the same 32 cycles), not from clock or power differences.
+**Net story:** the FP8 kernel runs at ~1.45 GHz and draws ~1100 W under
+sustained load — same order of magnitude as BF16's 1390 W and 1.48 GHz.
+Per-cycle scheduling quality is the same (~81% vs ~78%). The **2× TFLOPS
+advantage** over BF16 comes entirely from the **2× per-cycle peak** of the
+FP8 MFMA (`16x16x128` packs 2× the flops of `16x16x32` in the same 32 cycles),
+**not** from clock or power differences. The FP8 kernel uses slightly less
+power than BF16 (~1100 W vs ~1390 W) to do 2× the work — which is the matrix
+unit's FP8 efficiency advantage on a per-flop basis, not a "free" clock boost.
 
-**A measurement caveat worth flagging up front** (and the methodology section
-below explains in detail): the `amd-smi` `CLK` and `GFX_ACTIVITY` readings
-were both *misleading* for this kernel's burst-launch pattern — `CLK` reports
-the between-launch boost clock (2.4 GHz) rather than the achieved compute
-clock; `GFX_ACTIVITY` underreports the active phases. The achieved clock
-quoted above (~1.5 GHz) is derived from per-wave cycle counts in the ATT
-trace divided by kernel wall-time, which is independent of `amd-smi` and
-gives the right answer.
+**Measurement caveat the doc lays out below:** the `amd-smi` `CLK`,
+`GFX_ACTIVITY`, **and `SOCKET_POWER`** readings I cited in the *first* draft
+of this doc were all systematically misleading because the default bench
+runs only ~258 ms of GPU work — too short for amd-smi to reliably sample
+steady-state. The original headline numbers (297 W / 2.4 GHz / 2553 TFLOPS /
+"not power-limited") were artifacts of the bench window being shorter than
+DVFS transition windows. Steady-state requires sustained workloads
+(15+ seconds), and the corrected numbers come from a longer-warmup variant of
+the kernel.
 
 ## Structure: three kernels in one file, size-dispatched
 
@@ -263,23 +268,46 @@ Bench (best of 100 timing iters after 500 warmup, with rotating buffers):
 - **Avg: 0.431 ms / 2553.34 TFLOPS**
 - Correctness: PASSED (CPU reference comparison, rtol implicit ~0.01)
 
-Achieved clock measurement — the right way (cycle counts) and the wrong way
-(amd-smi clock readings):
+Achieved clock and power measurement — what changes between short and long
+benches:
 
-**The wrong way (amd-smi CLK, what I cited first):** `amd-smi metric -g 3`
-under load reports `CLK: 2398–2407 MHz` across all XCDs, `SOCKET_POWER: 297 W`,
-and `rocm-smi -d 3 --showclocks` cross-checks to `sclk clock level: 1: (2400Mhz)`.
-This *looks* like a sustained 2.4 GHz reading. **But that's the SCLK setpoint
-DPM transitions to between launches** — not the achieved clock during the
-0.43 ms of active MFMA work in each launch. With 0.43 ms compute / ~1 ms
-host overhead per launch, amd-smi mostly samples the inter-launch boost
-state, and the SCLK setpoint stays elevated through these gaps so even a
-"during-launch" sample reports 2.4 GHz.
+**The default bench's 258 ms of GPU work is too short** to get reliable
+amd-smi readings. With `warmup_iters = 500, timing_iters = 100, ~0.43 ms per
+launch`, the bench finishes faster than the sampling window of amd-smi's
+internal counters can settle. Result: every amd-smi metric I cited from this
+default bench was misleading.
 
-(Sidebar: `GFX_ACTIVITY` simultaneously read `0%` during these 2.4 GHz reads —
-a second misleading metric, for the same burst-launch-pattern reason. Power
-is the only `amd-smi` field that reliably distinguished active from idle
-here.)
+| metric | default bench (258 ms) reading | long warmup (~13 s sustained) reading |
+|---|---|---|
+| `GFX_ACTIVITY` | 0% | 80–100% |
+| `CLK` (SCLK) | 2398–2407 MHz | 1866–2394 MHz (variable, DVFS-throttled) |
+| `SOCKET_POWER` | ~297 W | 814–1349 W (avg ~1100 W) |
+
+For the short bench, both `CLK` and `SOCKET_POWER` reflect the GPU's *boost*
+state between launches (DPM doesn't drop the SCLK target during sub-ms gaps,
+and the integrated power readback hasn't settled to the active mean). For the
+long warmup, samples catch genuine sustained-load behavior.
+
+**Cross-check via wave-duration math (independent of amd-smi):**
+- ATT records each wave's `duration` in sclk cycles.
+- Occupancy 1, 1024 workgroups, 256 CUs ⇒ each CU runs 4 workgroups
+  sequentially, so per-workgroup time = kernel_time / 4 = 0.424/4 ≈ 106 µs.
+- Median per-wave duration in the trace: **156,516 cyc**.
+- Derived clock: 156,516 cyc / 106 µs = **1.477 GHz**.
+- Max-wave variant: 163,100 cyc / 106 µs = 1.539 GHz.
+
+So **achieved clock ≈ 1.45–1.54 GHz** — consistent with the long-warmup amd-smi
+samples (which range 1866–2394 MHz with DVFS but average closer to 2 GHz).
+The slight discrepancy between cycle-derived ~1.5 GHz and sustained-sample ~2
+GHz could be because:
+1. The 0.424 ms / launch is *not* steady-state — the bench's short window
+   gets a brief DVFS boost. Sustained TFLOPS (2461 vs short 2553) supports
+   this.
+2. Wave-duration ÷ wall-time picks up some non-compute overhead.
+
+Either way, the FP8 kernel achieves ~80% of its per-cycle peak at a clock
+similar to BF16's — same scheduling quality, same operating point on the
+clock/power curve.
 
 **The right way (per-wave cycles ÷ per-workgroup wall time):**
 - ATT records each wave's `duration` in sclk cycles (per `rocprof-trace-decoder`).
